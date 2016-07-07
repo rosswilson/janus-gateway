@@ -9,7 +9,7 @@
  * to make sure they are coherent with the involved SSRCs. In order to
  * demonstrate how peer-provided messages can change the behaviour of a
  * plugin, this plugin implements a simple API based on three messages:
- * 
+ *
  * 1. a message to enable/disable audio (that is, to tell the plugin
  * whether incoming audio RTP packets need to be sent back or discarded);
  * 2. a message to enable/disable video (that is, to tell the plugin
@@ -17,13 +17,13 @@
  * 3. a message to cap the bitrate (which would modify incoming RTCP
  * REMB messages before sending them back, in order to trick the peer into
  * thinking the available bandwidth is different).
- * 
+ *
  * \section echoapi Echo Test API
- * 
+ *
  * There's a single unnamed request you can send and it's asynchronous,
  * which means all responses (successes and errors) will be delivered
- * as events with the same transaction. 
- * 
+ * as events with the same transaction.
+ *
  * The request has to be formatted as follows. All the attributes are
  * optional, so any request can contain a subset of them:
  *
@@ -41,25 +41,25 @@
  * frames; \c video does the same for video; \c bitrate caps the
  * bandwidth to force on the browser encoding side (e.g., 128000 for
  * 128kbps).
- * 
+ *
  * The first request must be sent together with a JSEP offer to
  * negotiate a PeerConnection: a JSEP answer will be provided with
  * the asynchronous response notification. Subsequent requests (e.g., to
  * dynamically manipulate the bitrate while testing) have to be sent
  * without any JSEP payload attached.
- * 
+ *
  * A successful request will result in an \c ok event:
- * 
+ *
 \verbatim
 {
 	"echotest" : "event",
 	"result": "ok"
 }
 \endverbatim
- * 
+ *
  * An error instead will provide both an error code and a more verbose
  * description of the cause of the issue:
- * 
+ *
 \verbatim
 {
 	"echotest" : "event",
@@ -71,7 +71,7 @@
  * If the plugin detects a loss of the associated PeerConnection, a
  * "done" notification is triggered to inform the application the Echo
  * Test session is over:
- * 
+ *
 \verbatim
 {
 	"echotest" : "event",
@@ -118,6 +118,7 @@ const char *janus_echotest_get_package(void);
 void janus_echotest_create_session(janus_plugin_session *handle, int *error);
 struct janus_plugin_result *janus_echotest_handle_message(janus_plugin_session *handle, char *transaction, char *message, char *sdp_type, char *sdp);
 void janus_echotest_setup_media(janus_plugin_session *handle);
+void janus_echotest_send_rtcp_feedback(janus_plugin_session *handle, int video, char *buf, int len);
 void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len);
 void janus_echotest_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len);
 void janus_echotest_incoming_data(janus_plugin_session *handle, char *buf, int len);
@@ -139,7 +140,7 @@ static janus_plugin janus_echotest_plugin =
 		.get_name = janus_echotest_get_name,
 		.get_author = janus_echotest_get_author,
 		.get_package = janus_echotest_get_package,
-		
+
 		.create_session = janus_echotest_create_session,
 		.handle_message = janus_echotest_handle_message,
 		.setup_media = janus_echotest_setup_media,
@@ -191,6 +192,11 @@ typedef struct janus_echotest_session {
 	guint16 slowlink_count;
 	volatile gint hangingup;
 	gint64 destroyed;	/* Time at which this session was marked as destroyed */
+	int udp_sock; /* The udp socket on which to forward rtp packets */
+	guint video_keyframe_interval; /* keyframe request interval (ms) */
+	guint64 video_keyframe_request_last; /* timestamp of last keyframe request sent */
+	gint video_fir_seq;
+	guint64 video_remb_last;
 } janus_echotest_session;
 static GHashTable *sessions;
 static GList *old_sessions;
@@ -246,6 +252,13 @@ void *janus_echotest_watchdog(void *data) {
 					old_sessions = g_list_delete_link(old_sessions, sl);
 					sl = rm;
 					session->handle = NULL;
+
+					// Clean up our RTP forwarding socket
+					if(session->udp_sock > 0) {
+						close(session->udp_sock);
+						session->udp_sock = 0;
+					}
+
 					g_free(session);
 					session = NULL;
 					continue;
@@ -282,7 +295,7 @@ int janus_echotest_init(janus_callbacks *callback, const char *config_path) {
 	/* This plugin actually has nothing to configure... */
 	janus_config_destroy(config);
 	config = NULL;
-	
+
 	sessions = g_hash_table_new(NULL, NULL);
 	janus_mutex_init(&sessions_mutex);
 	messages = g_async_queue_new_full((GDestroyNotify) janus_echotest_message_free);
@@ -370,7 +383,7 @@ void janus_echotest_create_session(janus_plugin_session *handle, int *error) {
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
 		*error = -1;
 		return;
-	}	
+	}
 	janus_echotest_session *session = (janus_echotest_session *)g_malloc0(sizeof(janus_echotest_session));
 	if(session == NULL) {
 		JANUS_LOG(LOG_FATAL, "Memory error!\n");
@@ -386,6 +399,11 @@ void janus_echotest_create_session(janus_plugin_session *handle, int *error) {
 	janus_mutex_init(&session->rec_mutex);
 	session->bitrate = 0;	/* No limit */
 	session->destroyed = 0;
+	session->udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	session->video_keyframe_request_last = 0;
+	session->video_keyframe_interval = 5000; 	/* Request a keyframe every 5 seconds */
+	session->video_fir_seq = 0;
+	session->video_remb_last = janus_get_monotonic_time();
 	g_atomic_int_set(&session->hangingup, 0);
 	handle->plugin_handle = session;
 	janus_mutex_lock(&sessions_mutex);
@@ -399,7 +417,7 @@ void janus_echotest_destroy_session(janus_plugin_session *handle, int *error) {
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
 		*error = -1;
 		return;
-	}	
+	}
 	janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;
 	if(!session) {
 		JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
@@ -421,7 +439,7 @@ void janus_echotest_destroy_session(janus_plugin_session *handle, int *error) {
 char *janus_echotest_query_session(janus_plugin_session *handle) {
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
 		return NULL;
-	}	
+	}
 	janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;
 	if(!session) {
 		JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
@@ -472,7 +490,7 @@ void janus_echotest_setup_media(janus_plugin_session *handle) {
 	JANUS_LOG(LOG_INFO, "WebRTC media is now available\n");
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
-	janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;	
+	janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;
 	if(!session) {
 		JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 		return;
@@ -483,13 +501,39 @@ void janus_echotest_setup_media(janus_plugin_session *handle) {
 	/* We really don't care, as we only send RTP/RTCP we get in the first place back anyway */
 }
 
+void janus_echotest_send_rtcp_feedback(janus_plugin_session *handle, int video, char *buf, int len) {
+	if(video != 1)
+		return;	/* We just do this for video, for now */
+
+	janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;
+	char rtcpbuf[24];
+
+	gint64 now = janus_get_monotonic_time();
+	guint64 elapsed = now - session->video_remb_last;
+
+	/* Request a keyframe on a regular basis (every session->video_keyframe_interval ms) */
+	elapsed = now - session->video_keyframe_request_last;
+	guint64 interval = (session->video_keyframe_interval / 1000) * G_USEC_PER_SEC;
+
+	if(elapsed >= interval) {
+		/* Send both a FIR and a PLI, just to be sure */
+		memset(rtcpbuf, 0, 20);
+		janus_rtcp_fir((char *)&rtcpbuf, 20, &session->video_fir_seq);
+		gateway->relay_rtcp(handle, video, rtcpbuf, 20);
+		memset(rtcpbuf, 0, 12);
+		janus_rtcp_pli((char *)&rtcpbuf, 12);
+		gateway->relay_rtcp(handle, video, rtcpbuf, 12);
+		session->video_keyframe_request_last = now;
+	}
+}
+
 void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len) {
 	if(handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	/* Simple echo test */
 	if(gateway) {
 		/* Honour the audio/video active flags */
-		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;	
+		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;
 		if(!session) {
 			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 			return;
@@ -497,11 +541,26 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 		if(session->destroyed)
 			return;
 		if((!video && session->audio_active) || (video && session->video_active)) {
+
+			if (session->udp_sock) {
+				// Setup where we're going to stream the video frames to
+				struct sockaddr_in addr;
+				addr.sin_family = AF_INET;
+				addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+				addr.sin_port = htons( 5006 );
+
+				// JANUS_LOG(LOG_VERB, "Forwarding RTP packets out to 127.0.0.0:5006\n");
+
+				sendto(session->udp_sock, buf, len, 0, (struct sockaddr*)&addr, sizeof(struct sockaddr_in));
+			}
+
 			/* Save the frame if we're recording */
 			janus_recorder_save_frame(video ? session->vrc : session->arc, buf, len);
 			/* Send the frame back */
 			gateway->relay_rtp(handle, video, buf, len);
 		}
+
+		janus_echotest_send_rtcp_feedback(handle, video, buf, len);
 	}
 }
 
@@ -510,7 +569,7 @@ void janus_echotest_incoming_rtcp(janus_plugin_session *handle, int video, char 
 		return;
 	/* Simple echo test */
 	if(gateway) {
-		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;	
+		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;
 		if(!session) {
 			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 			return;
@@ -528,7 +587,7 @@ void janus_echotest_incoming_data(janus_plugin_session *handle, char *buf, int l
 		return;
 	/* Simple echo test */
 	if(gateway) {
-		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;	
+		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;
 		if(!session) {
 			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 			return;
@@ -557,7 +616,7 @@ void janus_echotest_slow_link(janus_plugin_session *handle, int uplink, int vide
 	/* The core is informing us that our peer got or sent too many NACKs, are we pushing media too hard? */
 	if(handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
-	janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;	
+	janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;
 	if(!session) {
 		JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 		return;
@@ -957,7 +1016,7 @@ static void *janus_echotest_handler(void *data) {
 		g_free(event_text);
 		janus_echotest_message_free(msg);
 		continue;
-		
+
 error:
 		{
 			if(root != NULL)
