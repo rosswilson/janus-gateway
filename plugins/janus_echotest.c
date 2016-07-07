@@ -508,11 +508,9 @@ void janus_echotest_send_rtcp_feedback(janus_plugin_session *handle, int video, 
 	janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;
 	char rtcpbuf[24];
 
-	gint64 now = janus_get_monotonic_time();
-	guint64 elapsed = now - session->video_remb_last;
-
 	/* Request a keyframe on a regular basis (every session->video_keyframe_interval ms) */
-	elapsed = now - session->video_keyframe_request_last;
+	gint64 now = janus_get_monotonic_time();
+	guint64 elapsed = now - session->video_keyframe_request_last;
 	guint64 interval = (session->video_keyframe_interval / 1000) * G_USEC_PER_SEC;
 
 	if(elapsed >= interval) {
@@ -520,9 +518,11 @@ void janus_echotest_send_rtcp_feedback(janus_plugin_session *handle, int video, 
 		memset(rtcpbuf, 0, 20);
 		janus_rtcp_fir((char *)&rtcpbuf, 20, &session->video_fir_seq);
 		gateway->relay_rtcp(handle, video, rtcpbuf, 20);
+
 		memset(rtcpbuf, 0, 12);
 		janus_rtcp_pli((char *)&rtcpbuf, 12);
 		gateway->relay_rtcp(handle, video, rtcpbuf, 12);
+
 		session->video_keyframe_request_last = now;
 	}
 }
@@ -542,20 +542,20 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 			return;
 		if((!video && session->audio_active) || (video && session->video_active)) {
 
-			if (session->udp_sock) {
-				// Setup where we're going to stream the video frames to
+			// Only forward video packets for now
+			if (video && session->udp_sock) {
+				// This setup should probably be done once, rather than for each packet
 				struct sockaddr_in addr;
 				addr.sin_family = AF_INET;
-				addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-				addr.sin_port = htons( 5006 );
-
-				// JANUS_LOG(LOG_VERB, "Forwarding RTP packets out to 127.0.0.0:5006\n");
+				inet_pton(AF_INET, "127.0.0.1", &(addr.sin_addr.s_addr));
+				addr.sin_port = htons(5006);
 
 				sendto(session->udp_sock, buf, len, 0, (struct sockaddr*)&addr, sizeof(struct sockaddr_in));
 			}
 
 			/* Save the frame if we're recording */
 			janus_recorder_save_frame(video ? session->vrc : session->arc, buf, len);
+
 			/* Send the frame back */
 			gateway->relay_rtp(handle, video, buf, len);
 		}
